@@ -46,7 +46,10 @@ install: check
 		echo "Config exists, not overwriting: $(CONFIG_DIR)/config.json"; \
 	fi
 	@systemctl --user daemon-reload
-	@systemctl --user enable --now "$(UNIT_NAME)"
+	@systemctl --user enable "$(UNIT_NAME)"
+	@# restart, not `enable --now`: on an upgrade the unit is already running and
+	@# would otherwise keep serving the previous binary.
+	@systemctl --user restart "$(UNIT_NAME)"
 	@echo "Installed and started $(UNIT_NAME)"
 
 uninstall: disable
