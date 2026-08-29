@@ -15,10 +15,10 @@ CFG_SRC  := config/config.json
 
 PYTHON ?= python3
 
-.PHONY: all install uninstall enable disable status logs check
+.PHONY: all install uninstall enable disable status logs check test
 
 all:
-	@echo "Targets: install uninstall enable disable status logs check"
+	@echo "Targets: install uninstall enable disable status logs check test"
 
 check:
 	@$(PYTHON) -c "import pyudev" >/dev/null 2>&1 || { \
@@ -30,6 +30,9 @@ check:
 	}
 	@$(PYTHON) -m py_compile "$(SRC_BIN)"
 	@echo "Dependencies OK ($(PYTHON))"
+
+test: check
+	@$(PYTHON) -m unittest discover -s tests -t tests
 
 install: check
 	@mkdir -p "$(BIN_DIR)"
