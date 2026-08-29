@@ -13,12 +13,25 @@ SRC_BIN := src/$(PROJECT).py
 UNIT_SRC := systemd/$(UNIT_NAME)
 CFG_SRC  := config/config.json
 
-.PHONY: all install uninstall enable disable status logs
+PYTHON ?= python3
+
+.PHONY: all install uninstall enable disable status logs check
 
 all:
-	@echo "Targets: install uninstall enable disable status logs"
+	@echo "Targets: install uninstall enable disable status logs check"
 
-install:
+check:
+	@$(PYTHON) -c "import pyudev" >/dev/null 2>&1 || { \
+		echo "Missing dependency: pyudev"; \
+		echo "  pip install --user -r requirements.txt"; \
+		echo "  pacman -S python-pyudev      # Arch"; \
+		echo "  apt install python3-pyudev   # Debian/Ubuntu"; \
+		exit 1; \
+	}
+	@$(PYTHON) -m py_compile "$(SRC_BIN)"
+	@echo "Dependencies OK ($(PYTHON))"
+
+install: check
 	@mkdir -p "$(BIN_DIR)"
 	@install -m 0755 "$(SRC_BIN)" "$(BIN_DIR)/$(BIN_NAME)"
 	@mkdir -p "$(SYSTEMD_USER_DIR)"
