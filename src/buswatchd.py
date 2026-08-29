@@ -62,15 +62,54 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+# Package name for pyudev per distro family. Keyed by the ID / ID_LIKE fields of
+# /etc/os-release, so the hint matches the machine instead of guessing.
+_PKG_HINTS = {
+    "debian": "sudo apt install python3-pyudev",
+    "ubuntu": "sudo apt install python3-pyudev",
+    "arch": "sudo pacman -S python-pyudev",
+    "fedora": "sudo dnf install python3-pyudev",
+    "rhel": "sudo dnf install python3-pyudev",
+    "centos": "sudo dnf install python3-pyudev",
+    "suse": "sudo zypper install python3-pyudev",
+    "opensuse": "sudo zypper install python3-pyudev",
+    "alpine": "sudo apk add py3-pyudev",
+    "void": "sudo xbps-install python3-pyudev",
+    "gentoo": "sudo emerge dev-python/pyudev",
+}
+
+
+def _os_release_ids() -> list:
+    """IDs for this machine, most specific first: ID, then ID_LIKE entries."""
+    ids = []
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key in {"ID", "ID_LIKE"}:
+                ids.extend(value.strip().strip('"\'').split())
+    except Exception:
+        pass
+    return ids
+
+
+def install_hints() -> list:
+    """Install commands to suggest, the distro's own package manager first."""
+    hints = []
+    for ident in _os_release_ids():
+        hint = _PKG_HINTS.get(ident)
+        if hint and hint not in hints:
+            hints.append(hint)
+    # pip always works, but a distro package is the better answer when there is one.
+    hints.append("pip install --user -r requirements.txt")
+    return hints
+
+
 try:
     import pyudev
 except ImportError as _e:  # pragma: no cover - depends on the host environment
     raise SystemExit(
-        "buswatchd: missing required dependency 'pyudev' (%s).\n"
-        "Install it with one of:\n"
-        "  pip install --user pyudev\n"
-        "  pacman -S python-pyudev      # Arch\n"
-        "  apt install python3-pyudev   # Debian/Ubuntu" % _e
+        "buswatchd: missing required dependency 'pyudev' (%s).\nInstall it with:\n  %s"
+        % (_e, "\n  ".join(install_hints()))
     )
 
 
@@ -81,6 +120,32 @@ USB_CACHE_MAX_ENTRIES = 512
 
 # Bound for the queue of pending interactive prompts.
 PROMPT_QUEUE_MAX = 16
+
+# Minimum pyudev the poll loop needs. requirements.txt is checked against this
+# by the test suite, so the constraint has exactly one source of truth.
+MIN_PYUDEV = (0, 24)
+
+# Every setting the daemon understands, with the value used when the config file
+# does not mention it. A user config is an override layer, never a complete
+# document: keys added by a later release apply on upgrade without the existing
+# config needing to be touched. A None default means "unset, work it out at
+# runtime" and is never written into a config file.
+DEFAULTS: Dict[str, Any] = {
+    "notify_timeout_ms": 30000,
+    "interactive": True,
+    "menu_preference": "auto",
+    "log_level": "INFO",
+    "state_dir": None,
+    "usb": {
+        "notify_add": True,
+        "notify_remove": True,
+        "dedupe_window_ms": 1200,
+        "block_enforcement": "direct",
+    },
+    "drm": {
+        "notify_changes": True,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -485,20 +550,20 @@ class BusWatchd:
         children: Optional[ChildProcs] = None,
         prompts: Optional[PromptWorker] = None,
     ) -> None:
-        self.cfg = cfg
+        self.cfg = merge_config(DEFAULTS, cfg)
         self.children = children if children is not None else ChildProcs()
         self.prompts = prompts if prompts is not None else PromptWorker()
         self.state = StateStore(state_dir)
 
-        self._interactive = bool(cfg.get("interactive", True))
-        self._timeout_ms = int(cfg.get("notify_timeout_ms", 30000))
+        self._interactive = bool(self.cfg["interactive"])
+        self._timeout_ms = int(self.cfg["notify_timeout_ms"])
 
         # USB debounce: suppress repeats within this window
-        self._usb_dedupe_ms = int(cfg.get("usb", {}).get("dedupe_window_ms", 1200))
+        self._usb_dedupe_ms = int(self.cfg["usb"]["dedupe_window_ms"])
         self._recent_usb: Dict[str, float] = {}  # key -> last monotonic time
 
         # How hard to try when actually deauthorizing a blocked device.
-        self._block_enforcement = str(cfg.get("usb", {}).get("block_enforcement", "direct")).lower()
+        self._block_enforcement = str(self.cfg["usb"]["block_enforcement"]).lower()
         if self._block_enforcement not in {"direct", "pkexec", "sudo", "none"}:
             LOG.warning(
                 "Unknown usb.block_enforcement %r; falling back to 'direct'",
@@ -507,7 +572,7 @@ class BusWatchd:
             self._block_enforcement = "direct"
 
         self.notifier = Notifier(timeout_ms=self._timeout_ms, children=self.children)
-        self.menu = MenuChooser(preference=str(cfg.get("menu_preference", "auto")), children=self.children)
+        self.menu = MenuChooser(preference=str(self.cfg["menu_preference"]), children=self.children)
 
         self._drm_status = self._read_drm_status()
 
@@ -719,7 +784,7 @@ class BusWatchd:
         return self.menu.run(prompt, ["Trust", "Block", "Ignore"])
 
     def _handle_usb_add(self, ev: UsbEvent) -> None:
-        if not self.cfg.get("usb", {}).get("notify_add", True):
+        if not self.cfg["usb"]["notify_add"]:
             return
 
         # Cache early so remove event can still show something.
@@ -800,7 +865,7 @@ class BusWatchd:
         # ignore -> nothing
 
     def _handle_usb_remove(self, ev: UsbEvent) -> None:
-        if not self.cfg.get("usb", {}).get("notify_remove", True):
+        if not self.cfg["usb"]["notify_remove"]:
             return
 
         ident = ev.ident
@@ -825,7 +890,7 @@ class BusWatchd:
         self.notifier.notify(f"USB remove: {name}", body)
 
     def _handle_drm_change(self) -> None:
-        if not self.cfg.get("drm", {}).get("notify_changes", True):
+        if not self.cfg["drm"]["notify_changes"]:
             return
 
         diff = self._diff_drm()
@@ -911,6 +976,157 @@ def resolve_state_dir(cfg: Dict[str, Any], cfg_path: Path, cli_state_dir: Option
     return cfg_path.parent
 
 
+def merge_config(defaults: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay a user config onto the defaults, recursing into nested sections."""
+    out = dict(defaults)
+    for k, v in (user or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_config(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def unknown_keys(user: Dict[str, Any], defaults: Dict[str, Any] = None, prefix: str = "") -> list:
+    """Keys present in the config that the daemon does not understand.
+
+    Catches both typos and keys left behind by an older release.
+    """
+    defaults = DEFAULTS if defaults is None else defaults
+    found = []
+    for k, v in (user or {}).items():
+        path = prefix + k
+        if k not in defaults:
+            found.append(path)
+        elif isinstance(defaults[k], dict) and isinstance(v, dict):
+            found.extend(unknown_keys(v, defaults[k], path + "."))
+    return sorted(found)
+
+
+def missing_keys(user: Dict[str, Any], defaults: Dict[str, Any] = None, prefix: str = "") -> list:
+    """Settings this release understands that the config file does not mention."""
+    defaults = DEFAULTS if defaults is None else defaults
+    found = []
+    for k, dv in defaults.items():
+        path = prefix + k
+        if isinstance(dv, dict):
+            sub_user = user.get(k) if isinstance(user, dict) else None
+            found.extend(missing_keys(sub_user if isinstance(sub_user, dict) else {}, dv, path + "."))
+        elif dv is None:
+            continue  # optional, never written out
+        elif not isinstance(user, dict) or k not in user:
+            found.append(path)
+    return sorted(found)
+
+
+def fill_missing(user: Dict[str, Any], defaults: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Add absent settings at their default, leaving every existing value alone."""
+    defaults = DEFAULTS if defaults is None else defaults
+    out = dict(user or {})
+    for k, dv in defaults.items():
+        if isinstance(dv, dict):
+            existing = out.get(k)
+            out[k] = fill_missing(existing if isinstance(existing, dict) else {}, dv)
+        elif dv is not None and k not in out:
+            out[k] = dv
+    return out
+
+
+def pyudev_version() -> Tuple[Tuple[int, ...], str]:
+    raw = str(getattr(pyudev, "__version__", "0"))
+    parts = []
+    for chunk in raw.split(".")[:2]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < len(MIN_PYUDEV):
+        parts.append(0)
+    return tuple(parts), raw
+
+
+def cmd_check_deps() -> int:
+    """Report what is installed. Fails only on what the daemon cannot run without."""
+    import platform
+
+    version, raw = pyudev_version()
+    required = ".".join(str(n) for n in MIN_PYUDEV)
+    ok = version >= MIN_PYUDEV
+
+    print(f"python:        {platform.python_version()}")
+    print(f"pyudev:        {raw} (>= {required} required){'' if ok else '   TOO OLD'}")
+
+    notifier = shutil.which("notify-send") or shutil.which("dunstify")
+    print(f"notifications: {Path(notifier).name if notifier else 'MISSING (need notify-send or dunstify)'}")
+
+    menu = next(
+        (m for m in ("rofi-wayland", "rofi", "wofi", "dmenu") if shutil.which(m)),
+        None,
+    )
+    print(f"menu:          {menu or 'none (the Options action will be unavailable)'}")
+
+    if not ok:
+        print(f"\npyudev {raw} is too old; the poll loop needs >= {required}. Install with:")
+        for hint in install_hints():
+            print(f"  {hint}")
+        return 1
+    if not notifier:
+        # Not fatal: the daemon installs fine before the desktop is set up.
+        print("\nWarning: no notification tool found, so nothing will be shown until one is installed.")
+    return 0
+
+
+def cmd_print_defaults() -> int:
+    print(json.dumps({k: v for k, v in DEFAULTS.items() if v is not None}, indent=2))
+    return 0
+
+
+def cmd_diff_config(cfg_path: Path) -> int:
+    """Show how a config file has drifted from what this release understands."""
+    raw = load_config(cfg_path)
+    missing = missing_keys(raw)
+    unknown = unknown_keys(raw)
+
+    print(f"config: {cfg_path}")
+    if missing:
+        print("\nnot set (this release's default applies):")
+        for key in missing:
+            print(f"  {key}")
+    if unknown:
+        print("\nnot understood by this release (ignored):")
+        for key in unknown:
+            print(f"  {key}")
+    if not missing and not unknown:
+        print("\nup to date with this release.")
+    else:
+        print("\nRun `make update-config` to write the missing settings into the file.")
+    return 0
+
+
+def cmd_update_config(cfg_path: Path) -> int:
+    """Write absent settings into the config at their defaults, preserving values."""
+    raw = load_config(cfg_path)
+    missing = missing_keys(raw)
+    for key in unknown_keys(raw):
+        print(f"note: leaving unrecognized key in place: {key}")
+
+    if not missing:
+        print(f"{cfg_path} is already up to date.")
+        return 0
+
+    backup = cfg_path.with_suffix(".json.bak")
+    backup.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    tmp = cfg_path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(fill_missing(raw), f, indent=2)
+        f.write("\n")
+    tmp.replace(cfg_path)
+
+    for key in missing:
+        print(f"added: {key}")
+    print(f"\nUpdated {cfg_path} (previous version saved to {backup}).")
+    return 0
+
+
 def setup_logging(level: str) -> None:
     lvl = getattr(logging, str(level).upper(), logging.INFO)
     logging.basicConfig(
@@ -922,20 +1138,60 @@ def setup_logging(level: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="buswatchd - USB/HDMI hotplug notifier")
-    ap.add_argument("--config", type=str, required=True, help="Path to config.json")
+    ap.add_argument("--config", type=str, default=None, help="Path to config.json")
     ap.add_argument(
         "--state-dir",
         type=str,
         default=None,
         help="Directory for trusted.json/blocked.json (default: the config file's directory)",
     )
+    ap.add_argument(
+        "--check-deps",
+        action="store_true",
+        help="Report dependency and desktop-tool status, then exit",
+    )
+    ap.add_argument(
+        "--print-defaults",
+        action="store_true",
+        help="Print this release's built-in default config as JSON, then exit",
+    )
+    ap.add_argument(
+        "--diff-config",
+        action="store_true",
+        help="Show how --config differs from this release's settings, then exit",
+    )
+    ap.add_argument(
+        "--update-config",
+        action="store_true",
+        help="Write absent settings into --config at their defaults, then exit",
+    )
     args = ap.parse_args()
 
-    cfg_path = Path(args.config).expanduser()
-    cfg = load_config(cfg_path)
+    if args.check_deps:
+        return cmd_check_deps()
+    if args.print_defaults:
+        return cmd_print_defaults()
 
-    setup_logging(cfg.get("log_level", "INFO"))
+    if not args.config:
+        ap.error("--config is required")
+    cfg_path = Path(args.config).expanduser()
+
+    if args.diff_config:
+        return cmd_diff_config(cfg_path)
+    if args.update_config:
+        return cmd_update_config(cfg_path)
+
+    raw = load_config(cfg_path)
+
+    setup_logging(raw.get("log_level", DEFAULTS["log_level"]))
     LOG.info("Starting buswatchd")
+
+    # An unrecognized key is silently ineffective otherwise: a typo, or a setting
+    # this release dropped. Say so rather than letting it look applied.
+    for key in unknown_keys(raw):
+        LOG.warning("Config key not understood by this release, ignoring: %s", key)
+
+    cfg = merge_config(DEFAULTS, raw)
 
     state_dir = resolve_state_dir(cfg, cfg_path, args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)

@@ -13,33 +13,57 @@ Runs as a systemd **user** service. One Python file, one dependency.
 
 - Linux with udev and systemd
 - Python 3.9+
-- [`pyudev`](https://pyudev.readthedocs.io/) (`requirements.txt`)
+- [`pyudev`](https://pyudev.readthedocs.io/) >= 0.24 (`requirements.txt`)
 - A notification daemon plus `notify-send` (preferred) or `dunstify`
 - Optional, for the "Options" menu: `rofi`, `rofi-wayland`, `wofi`, or `dmenu`
+
+`make check` reports all of these for the machine you are on, and names the
+right install command for your distribution rather than assuming one:
+
+```
+$ make check
+python:        3.13.5
+pyudev:        0.24.3 (>= 0.24 required)
+notifications: notify-send
+menu:          rofi
+```
+
+A distribution package is the better way to install `pyudev` where one exists
+(`python3-pyudev` on Debian/Ubuntu and Fedora, `python-pyudev` on Arch,
+`py3-pyudev` on Alpine); `pip install --user -r requirements.txt` works
+anywhere. If the dependency is missing, the daemon and `make check` both print
+the command for your distribution, read from `/etc/os-release`.
 
 ## Install
 
 ```sh
-pip install --user -r requirements.txt
 make install
 ```
 
-`make install` verifies the dependency first, copies the daemon to
+`make install` preflights the dependency first, copies the daemon to
 `~/.local/bin/buswatchd`, installs the user unit, seeds
 `~/.config/buswatchd/config.json` (never overwriting an existing one), and
 enables the service.
 
 ```sh
-make status     # systemctl --user status
-make logs       # last 200 journal lines
-make test       # run the test suite
-make check      # dependency + syntax preflight
-make uninstall  # remove binary and unit, keep config and state
+make status         # systemctl --user status
+make logs           # last 200 journal lines
+make test           # run the test suite
+make check          # dependency and syntax preflight
+make diff-config    # show how your config differs from this release
+make update-config  # write this release's new settings into your config
+make uninstall      # remove binary and unit, keep config and state
 ```
 
 ## Configuration
 
-`~/.config/buswatchd/config.json`:
+`~/.config/buswatchd/config.json`. Every setting has a default in the daemon,
+so the file is an **override layer, not a complete document** — it only needs
+the keys you actually want to change, and an empty `{}` is valid. Run
+`buswatchd --print-defaults` to see the full set this release understands.
+
+A key the daemon does not recognize is logged as ignored at startup, which
+catches both typos and settings dropped by a later release.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -57,6 +81,28 @@ make uninstall  # remove binary and unit, keep config and state
 State lives next to the config by default, so `--config /somewhere/else.json`
 keeps its `trusted.json` and `blocked.json` in `/somewhere`. Override with
 `--state-dir` or the `state_dir` key.
+
+## Upgrading
+
+Because defaults live in the daemon, **a config written by an older release
+keeps working**: settings added since are simply applied at their defaults, and
+nothing needs to be edited. `make install` deliberately never overwrites your
+config.
+
+That does mean a new setting is invisible in the file you edit by hand, so:
+
+```sh
+make diff-config    # what this release adds, and what it no longer understands
+make update-config  # write the new settings in at their defaults
+```
+
+`make update-config` preserves every value you have set, leaves unrecognized
+keys alone, and saves the previous file to `config.json.bak` before writing.
+
+There is no config-version field or migration table, and deliberately so:
+nothing has been renamed or removed yet, and the defaults layer means additive
+changes never need one. The first setting that gets renamed is the point at
+which a migration becomes worth writing.
 
 ## Blocking, and what it actually does
 
@@ -125,9 +171,14 @@ make test
 ```
 
 Or directly: `python3 -m unittest discover -s tests -t tests`. The suite covers
-the state store, dedupe, the bounded cache, DRM diffing, config and state-dir
-resolution, menu selection, block-enforcement reporting, and the off-thread
-prompt behaviour. No test needs real hardware or a notification daemon.
+the state store, dedupe, the bounded cache, DRM diffing, config layering and
+drift detection, state-dir resolution, menu selection, block-enforcement
+reporting, dependency preflighting, and the off-thread prompt behaviour. No
+test needs real hardware or a notification daemon.
+
+Two of them guard invariants rather than behaviour: that `requirements.txt` and
+the version constant in the daemon agree, and that the shipped example config
+is neither missing a setting nor carrying one the daemon no longer knows.
 
 ## License
 

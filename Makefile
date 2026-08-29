@@ -15,21 +15,20 @@ CFG_SRC  := config/config.json
 
 PYTHON ?= python3
 
-.PHONY: all install uninstall enable disable status logs check test
+.PHONY: all install uninstall enable disable status logs check test diff-config update-config
 
 all:
-	@echo "Targets: install uninstall enable disable status logs check test"
+	@echo "Targets: install uninstall enable disable status logs check test diff-config update-config"
 
 check:
-	@$(PYTHON) -c "import pyudev" >/dev/null 2>&1 || { \
-		echo "Missing dependency: pyudev"; \
-		echo "  pip install --user -r requirements.txt"; \
-		echo "  pacman -S python-pyudev      # Arch"; \
-		echo "  apt install python3-pyudev   # Debian/Ubuntu"; \
-		exit 1; \
-	}
 	@$(PYTHON) -m py_compile "$(SRC_BIN)"
-	@echo "Dependencies OK ($(PYTHON))"
+	@$(PYTHON) "$(SRC_BIN)" --check-deps
+
+diff-config:
+	@$(PYTHON) "$(SRC_BIN)" --config "$(CONFIG_DIR)/config.json" --diff-config
+
+update-config:
+	@$(PYTHON) "$(SRC_BIN)" --config "$(CONFIG_DIR)/config.json" --update-config
 
 test: check
 	@$(PYTHON) -m unittest discover -s tests -t tests
