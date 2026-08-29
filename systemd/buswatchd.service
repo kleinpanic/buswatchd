@@ -1,7 +1,10 @@
 [Unit]
 Description=buswatchd - USB/HDMI hotplug notifier
-# Needs a session bus and a running notification daemon, both of which belong to
-# the graphical session rather than to login.
+# Ordered after the graphical session because notify-send needs a session bus
+# and a running notification daemon. Ordering only, plus lifecycle: the unit is
+# WantedBy=default.target so it still autostarts on setups that never activate
+# graphical-session.target at all -- bare WMs, and anything without a session
+# manager that pulls the target in. Both directives are inert there.
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -13,4 +16,4 @@ RestartSec=2
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

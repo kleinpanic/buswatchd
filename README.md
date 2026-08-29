@@ -153,6 +153,13 @@ your own system before relying on it.
 - **udev filters are mandatory.** If installing the subsystem filters fails the
   daemon exits rather than running unfiltered and handling every event on the
   system.
+- **The unit installs into `default.target`, not `graphical-session.target`.**
+  It is ordered `After=` and `PartOf=` the graphical session, because
+  `notify-send` needs a session bus and a notification daemon. But
+  `graphical-session.target` is `static`: plenty of setups, bare window managers
+  especially, never activate it, and installing into it there means the daemon
+  simply never starts after a reboot. `default.target` autostarts everywhere and
+  the two ordering directives are inert where the target is absent.
 
 ## Layout
 
