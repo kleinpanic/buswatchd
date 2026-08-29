@@ -1,0 +1,14 @@
+{
+  "notify_timeout_ms": 30000,
+  "interactive": true,
+  "menu_preference": "auto",
+  "log_level": "INFO",
+  "usb": {
+    "notify_add": true,
+    "notify_remove": true,
+    "dedupe_window_ms": 1200
+  },
+  "drm": {
+    "notify_changes": true
+  }
+}

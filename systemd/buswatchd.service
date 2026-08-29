@@ -1,0 +1,13 @@
+[Unit]
+Description=buswatchd - USB/HDMI hotplug notifier
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/buswatchd --config %h/.config/buswatchd/config.json
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
