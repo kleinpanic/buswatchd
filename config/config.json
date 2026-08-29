@@ -6,7 +6,8 @@
   "usb": {
     "notify_add": true,
     "notify_remove": true,
-    "dedupe_window_ms": 1200
+    "dedupe_window_ms": 1200,
+    "block_enforcement": "direct"
   },
   "drm": {
     "notify_changes": true

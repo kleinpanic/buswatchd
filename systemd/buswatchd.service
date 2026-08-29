@@ -1,6 +1,9 @@
 [Unit]
 Description=buswatchd - USB/HDMI hotplug notifier
-After=default.target
+# Needs a session bus and a running notification daemon, both of which belong to
+# the graphical session rather than to login.
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -10,4 +13,4 @@ RestartSec=2
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

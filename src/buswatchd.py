@@ -17,11 +17,19 @@ Interactive mode (USB add only):
   - block: Block (tries /sys/.../authorized=0)
   - ignore: Ignore
 - With `notify-send`, actions are specified via -A/--action and the selected action
-  NAME is output to stdout.  (If nothing is selected, stdout is empty / no match.)
+  NAME is output to stdout. If nothing is selected, stdout is empty / no match.
+
+Threading:
+- The udev poll loop is the main thread and must never block. Interactive prompts
+  (which block for up to notify_timeout_ms, plus a menu) run on a dedicated prompt
+  thread, so hotplug events are not dropped while a prompt is on screen and SIGTERM
+  is honoured immediately.
 
 State:
-- ~/.config/buswatchd/trusted.json
-- ~/.config/buswatchd/blocked.json
+- <state_dir>/trusted.json
+- <state_dir>/blocked.json
+  where <state_dir> is --state-dir, else the config's "state_dir", else the
+  directory containing the config file.
 
 De-duplication:
 - udev can emit multiple closely-spaced events for the same physical action.
@@ -30,7 +38,10 @@ De-duplication:
 
 Important:
 - udev "remove" events often lack ID_* properties; we cache device metadata on "add"
-  to still show meaningful "remove" notifications.
+  to still show meaningful "remove" notifications. That cache is bounded (LRU).
+- Blocking a device writes /sys/.../authorized, which requires privileges a user
+  service does not have by default. Enforcement is reported honestly: a device can
+  be recorded as blocked without being deauthorized. See usb.block_enforcement.
 """
 
 from __future__ import annotations
@@ -40,20 +51,36 @@ import json
 import logging
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
-
-import pyudev
+try:
+    import pyudev
+except ImportError as _e:  # pragma: no cover - depends on the host environment
+    raise SystemExit(
+        "buswatchd: missing required dependency 'pyudev' (%s).\n"
+        "Install it with one of:\n"
+        "  pip install --user pyudev\n"
+        "  pacman -S python-pyudev      # Arch\n"
+        "  apt install python3-pyudev   # Debian/Ubuntu" % _e
+    )
 
 
 LOG = logging.getLogger("buswatchd")
+
+# Bound for the add-event metadata cache used to describe remove events.
+USB_CACHE_MAX_ENTRIES = 512
+
+# Bound for the queue of pending interactive prompts.
+PROMPT_QUEUE_MAX = 16
 
 
 @dataclass(frozen=True)
@@ -82,6 +109,14 @@ class DrmEvent:
     changes: Dict[str, Tuple[str, str]]  # connector -> (old, new)
 
 
+@dataclass(frozen=True)
+class EnforceResult:
+    """Outcome of trying to actually deauthorize a USB device."""
+
+    ok: bool
+    detail: str
+
+
 class StopFlag:
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -93,10 +128,133 @@ class StopFlag:
         return self._stop.is_set()
 
 
+class ChildProcs:
+    """
+    Runs blocking child processes while keeping them terminable.
+
+    Notification prompts and menus block for as long as the user leaves them open.
+    Tracking the live children lets shutdown tear them down instead of waiting out
+    the full notification timeout.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: set = set()
+        self._closed = False
+
+    def run(
+        self,
+        cmd: list[str],
+        *,
+        input_bytes: Optional[bytes] = None,
+        capture_stdout: bool = False,
+    ) -> Optional[str]:
+        """
+        Run cmd to completion. Returns stdout (text) when capture_stdout is set,
+        "" on success otherwise, and None if the child could not be run.
+        """
+        with self._lock:
+            if self._closed:
+                return None
+
+        try:
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            LOG.warning("Failed to run %s: %s", cmd[0], e)
+            return None
+
+        with self._lock:
+            if self._closed:
+                _terminate(p)
+                return None
+            self._procs.add(p)
+
+        try:
+            out, _ = p.communicate(input=input_bytes)
+        except Exception as e:
+            LOG.warning("%s failed: %s", cmd[0], e)
+            _terminate(p)
+            return None
+        finally:
+            with self._lock:
+                self._procs.discard(p)
+
+        if not capture_stdout:
+            return ""
+        return (out or b"").decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        """Stop accepting new children and terminate anything still running."""
+        with self._lock:
+            self._closed = True
+            procs = list(self._procs)
+        for p in procs:
+            _terminate(p)
+
+
+def _terminate(p: "subprocess.Popen") -> None:
+    try:
+        if p.poll() is None:
+            p.terminate()
+    except Exception:
+        pass
+
+
+class PromptWorker:
+    """
+    Serializes interactive prompts onto a single background thread.
+
+    One prompt at a time is deliberate: a burst of USB events should not stack up
+    four rofi menus. Overflow is dropped loudly rather than queued forever.
+    """
+
+    def __init__(self, maxsize: int = PROMPT_QUEUE_MAX) -> None:
+        self._q: "queue.Queue[Callable[[], None]]" = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._worker, name="prompt", daemon=True)
+
+    def start(self) -> None:
+        self._t.start()
+
+    def submit(self, fn: Callable[[], None]) -> bool:
+        if self._stop.is_set():
+            return False
+        try:
+            self._q.put_nowait(fn)
+            return True
+        except queue.Full:
+            LOG.warning("Prompt queue full (%d pending); dropping prompt", self._q.maxsize)
+            return False
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        if self._t.is_alive():
+            self._t.join(timeout=timeout)
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                fn = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                fn()
+            except Exception as e:
+                LOG.warning("Interactive prompt failed: %s", e)
+            finally:
+                self._q.task_done()
+
+
 class StateStore:
-    def __init__(self, config_dir: Path) -> None:
-        self.trusted_path = config_dir / "trusted.json"
-        self.blocked_path = config_dir / "blocked.json"
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.trusted_path = state_dir / "trusted.json"
+        self.blocked_path = state_dir / "blocked.json"
         self._lock = threading.Lock()
         self.trusted = self._load_map(self.trusted_path)
         self.blocked = self._load_map(self.blocked_path)
@@ -149,11 +307,13 @@ class NotificationBackend:
       1) notify-send (libnotify)
       2) dunstify
 
-    notify-send supports actions and prints selected action NAME to stdout.  :contentReference[oaicite:1]{index=1}
+    notify-send supports actions via -A/--action and prints the selected action
+    NAME to stdout; dunstify uses -A name,label with -b to block.
     """
 
-    def __init__(self, timeout_ms: int) -> None:
+    def __init__(self, timeout_ms: int, children: ChildProcs) -> None:
         self.timeout_ms = int(timeout_ms)
+        self.children = children
         self._notify_send = shutil.which("notify-send")
         self._dunstify = shutil.which("dunstify")
 
@@ -171,9 +331,23 @@ class NotificationBackend:
 
     def notify(self, summary: str, body: str) -> None:
         if self.kind == "notify-send":
-            self._notify_via_notify_send(summary, body)
+            self.children.run(
+                ["notify-send", "-a", "buswatchd", "-t", str(self.timeout_ms), summary, body]
+            )
         elif self.kind == "dunstify":
-            self._notify_via_dunstify(summary, body)
+            self.children.run(
+                [
+                    "dunstify",
+                    "-a",
+                    "buswatchd",
+                    "-t",
+                    str(self.timeout_ms),
+                    "-c",
+                    "device",
+                    summary,
+                    body,
+                ]
+            )
         else:
             LOG.error("No notification tool found (need notify-send or dunstify in PATH)")
 
@@ -181,80 +355,41 @@ class NotificationBackend:
         """
         Show an actionable notification and return the chosen action key, or None.
         actions: list of (key, label)
+
+        Blocks until the notification is actioned, dismissed or times out, so this
+        must not be called from the udev poll loop.
         """
         if self.kind == "notify-send":
-            return self._prompt_via_notify_send(summary, body, actions)
-        if self.kind == "dunstify":
-            return self._prompt_via_dunstify(summary, body, actions)
-        LOG.error("No notification tool found (need notify-send or dunstify in PATH)")
-        return None
-
-    def _notify_via_notify_send(self, summary: str, body: str) -> None:
-        cmd = [
-            "notify-send",
-            "-a",
-            "buswatchd",
-            "-t",
-            str(self.timeout_ms),
-            summary,
-            body,
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception as e:
-            LOG.warning("notify-send failed: %s", e)
-
-    def _prompt_via_notify_send(self, summary: str, body: str, actions: list[tuple[str, str]]) -> Optional[str]:
-        # notify-send: -A, --action=[NAME=]Text (repeatable). Selected NAME printed to stdout. :contentReference[oaicite:2]{index=2}
-        cmd = ["notify-send", "-a", "buswatchd", "-t", str(self.timeout_ms)]
-        for key, label in actions:
-            # NAME=Text
-            cmd += ["-A", f"{key}={label}"]
-        cmd += [summary, body]
-
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        except Exception as e:
-            LOG.warning("notify-send (actions) failed: %s", e)
+            cmd = ["notify-send", "-a", "buswatchd", "-t", str(self.timeout_ms)]
+            for key, label in actions:
+                cmd += ["-A", f"{key}={label}"]
+            cmd += [summary, body]
+        elif self.kind == "dunstify":
+            cmd = ["dunstify", "-a", "buswatchd", "-t", str(self.timeout_ms), "-c", "device"]
+            for key, label in actions:
+                cmd += ["-A", f"{key},{label}"]
+            cmd += ["-b", summary, body]
+        else:
+            LOG.error("No notification tool found (need notify-send or dunstify in PATH)")
             return None
 
-        out = p.stdout.decode("utf-8", errors="replace").strip()
-        allowed = {k for k, _ in actions}
-        return out if out in allowed else None
-
-    def _notify_via_dunstify(self, summary: str, body: str) -> None:
-        cmd = ["dunstify", "-a", "buswatchd", "-t", str(self.timeout_ms), "-c", "device", summary, body]
-        try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception as e:
-            LOG.warning("dunstify failed: %s", e)
-
-    def _prompt_via_dunstify(self, summary: str, body: str, actions: list[tuple[str, str]]) -> Optional[str]:
-        # dunstify: -A name,label and -b blocks; stdout is action name.
-        cmd = ["dunstify", "-a", "buswatchd", "-t", str(self.timeout_ms), "-c", "device"]
-        for key, label in actions:
-            cmd += ["-A", f"{key},{label}"]
-        cmd += ["-b", summary, body]
-
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        except Exception as e:
-            LOG.warning("dunstify (actions) failed: %s", e)
+        out = self.children.run(cmd, capture_stdout=True)
+        if out is None:
             return None
 
-        out = p.stdout.decode("utf-8", errors="replace").strip()
+        choice = out.strip()
         allowed = {k for k, _ in actions}
-        return out if out in allowed else None
+        return choice if choice in allowed else None
 
 
 class Notifier:
     """
     Simple async notifier for non-interactive notifications.
-    Interactive prompts are handled synchronously via prompt_actions().
+    Interactive prompts are dispatched to the PromptWorker by the caller.
     """
 
-    def __init__(self, timeout_ms: int) -> None:
-        self.backend = NotificationBackend(timeout_ms=timeout_ms)
+    def __init__(self, timeout_ms: int, children: ChildProcs) -> None:
+        self.backend = NotificationBackend(timeout_ms=timeout_ms, children=children)
         self._q: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self._t = threading.Thread(target=self._worker, name="notifier", daemon=True)
         self._t.start()
@@ -279,8 +414,9 @@ class MenuChooser:
     Prefer rofi, then wofi (if Wayland), then dmenu.
     """
 
-    def __init__(self, preference: str) -> None:
+    def __init__(self, preference: str, children: ChildProcs) -> None:
         self.preference = (preference or "auto").lower()
+        self.children = children
 
     def _have(self, cmd: str) -> bool:
         return any(os.access(os.path.join(p, cmd), os.X_OK) for p in os.environ.get("PATH", "").split(os.pathsep))
@@ -329,26 +465,30 @@ class MenuChooser:
     def run(self, prompt: str, options: list[str]) -> Optional[str]:
         cmd = self.build_cmd(prompt)
         if not cmd:
+            LOG.warning("No menu program found (need rofi, wofi or dmenu in PATH)")
             return None
-        try:
-            p = subprocess.run(
-                cmd,
-                input=("\n".join(options) + "\n").encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            choice = p.stdout.decode("utf-8", errors="replace").strip()
-            return choice or None
-        except Exception as e:
-            LOG.warning("Menu failed: %s", e)
+        out = self.children.run(
+            cmd,
+            input_bytes=("\n".join(options) + "\n").encode("utf-8"),
+            capture_stdout=True,
+        )
+        if out is None:
             return None
+        return out.strip() or None
 
 
 class BusWatchd:
-    def __init__(self, cfg: Dict[str, Any], config_dir: Path) -> None:
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        state_dir: Path,
+        children: Optional[ChildProcs] = None,
+        prompts: Optional[PromptWorker] = None,
+    ) -> None:
         self.cfg = cfg
-        self.state = StateStore(config_dir)
+        self.children = children if children is not None else ChildProcs()
+        self.prompts = prompts if prompts is not None else PromptWorker()
+        self.state = StateStore(state_dir)
 
         self._interactive = bool(cfg.get("interactive", True))
         self._timeout_ms = int(cfg.get("notify_timeout_ms", 30000))
@@ -357,26 +497,56 @@ class BusWatchd:
         self._usb_dedupe_ms = int(cfg.get("usb", {}).get("dedupe_window_ms", 1200))
         self._recent_usb: Dict[str, float] = {}  # key -> last monotonic time
 
-        self.notifier = Notifier(timeout_ms=self._timeout_ms)
-        self.menu = MenuChooser(preference=str(cfg.get("menu_preference", "auto")))
+        # How hard to try when actually deauthorizing a blocked device.
+        self._block_enforcement = str(cfg.get("usb", {}).get("block_enforcement", "direct")).lower()
+        if self._block_enforcement not in {"direct", "pkexec", "sudo", "none"}:
+            LOG.warning(
+                "Unknown usb.block_enforcement %r; falling back to 'direct'",
+                self._block_enforcement,
+            )
+            self._block_enforcement = "direct"
+
+        self.notifier = Notifier(timeout_ms=self._timeout_ms, children=self.children)
+        self.menu = MenuChooser(preference=str(cfg.get("menu_preference", "auto")), children=self.children)
 
         self._drm_status = self._read_drm_status()
 
-        # Cache for remove events (which may not have usable properties)
-        # Keyed by sys_path/device_path/sys_name -> stored event info from "add"
-        self._usb_cache: Dict[str, Tuple[Optional[UsbIdentity], str]] = {}
+        # Cache for remove events (which may not have usable properties).
+        # Keyed by sys_path/device_path/sys_name -> stored event info from "add".
+        # Bounded LRU: a long-lived daemon must not accumulate an entry per plug.
+        self._usb_cache: "OrderedDict[str, Tuple[Optional[UsbIdentity], str]]" = OrderedDict()
+
+    def start(self) -> None:
+        self.prompts.start()
+        LOG.info(
+            "Interactive=%s, block enforcement=%s, dedupe=%dms",
+            self._interactive,
+            self._block_enforcement,
+            self._usb_dedupe_ms,
+        )
+
+    def shutdown(self) -> None:
+        self.prompts.stop()
+        self.children.close()
+
+    def _cache_put(self, key: str, value: Tuple[Optional[UsbIdentity], str]) -> None:
+        if not key:
+            return
+        self._usb_cache[key] = value
+        self._usb_cache.move_to_end(key)
+        while len(self._usb_cache) > USB_CACHE_MAX_ENTRIES:
+            self._usb_cache.popitem(last=False)
 
     def _cache_usb(self, ev: UsbEvent) -> None:
-        self._usb_cache[ev.sys_path] = (ev.ident, ev.display_name)
-        if ev.device_path:
-            self._usb_cache[ev.device_path] = (ev.ident, ev.display_name)
-        if ev.sys_name:
-            self._usb_cache[ev.sys_name] = (ev.ident, ev.display_name)
+        value = (ev.ident, ev.display_name)
+        for key in (ev.sys_path, ev.device_path, ev.sys_name):
+            self._cache_put(key, value)
 
     def _lookup_usb_cache(self, sys_path: str, device_path: str, sys_name: str) -> Tuple[Optional[UsbIdentity], Optional[str]]:
         for k in (sys_path, device_path, sys_name):
             if k and k in self._usb_cache:
                 ident, name = self._usb_cache[k]
+                self._usb_cache.move_to_end(k)
                 return ident, name
         return None, None
 
@@ -452,7 +622,7 @@ class BusWatchd:
         self._drm_status = new
         return DrmEvent(changes=changes) if changes else None
 
-    def _usb_identity(self, dev: pyudev.Device) -> Optional[UsbIdentity]:
+    def _usb_identity(self, dev: "pyudev.Device") -> Optional[UsbIdentity]:
         vid = dev.properties.get("ID_VENDOR_ID")
         pid = dev.properties.get("ID_MODEL_ID")
 
@@ -479,25 +649,71 @@ class BusWatchd:
         serial_s = str(serial).strip() or "noserial"
         return UsbIdentity(vid=vid_s, pid=pid_s, serial=serial_s)
 
-    def _usb_name(self, dev: pyudev.Device) -> str:
+    def _usb_name(self, dev: "pyudev.Device") -> str:
         vendor = dev.properties.get("ID_VENDOR_FROM_DATABASE") or dev.properties.get("ID_VENDOR") or ""
         product = dev.properties.get("ID_MODEL_FROM_DATABASE") or dev.properties.get("ID_MODEL") or ""
         name = f"{vendor} {product}".strip()
         return name if name else "USB device"
 
-    def _try_set_usb_authorized(self, sys_path: str, authorized: bool) -> bool:
+    def _enforce_block(self, sys_path: str) -> EnforceResult:
+        """
+        Try to actually deauthorize the device.
+
+        A user service cannot write /sys/bus/usb/devices/*/authorized without help,
+        so this reports what really happened instead of implying enforcement.
+        """
+        if self._block_enforcement == "none":
+            return EnforceResult(False, "recorded only (enforcement disabled)")
+
+        if not sys_path:
+            return EnforceResult(False, "recorded only (no sysfs path)")
+
         auth_path = Path(sys_path) / "authorized"
         if not auth_path.exists():
-            return False
+            return EnforceResult(False, "recorded only (no authorized attribute)")
+
         try:
-            auth_path.write_text("1" if authorized else "0", encoding="utf-8")
-            return True
+            auth_path.write_text("0", encoding="utf-8")
+            return EnforceResult(True, "deauthorized")
         except PermissionError:
-            LOG.warning("Permission denied writing %s (need elevated privileges to enforce block/allow)", auth_path)
-            return False
+            LOG.info("Cannot write %s directly; trying %s", auth_path, self._block_enforcement)
         except Exception as e:
             LOG.warning("Failed writing %s: %s", auth_path, e)
-            return False
+            return EnforceResult(False, f"recorded only ({e})")
+
+        helper = self._privileged_helper()
+        if helper is None:
+            LOG.warning(
+                "Device recorded as blocked but NOT deauthorized: writing %s needs privileges. "
+                "See README (usb.block_enforcement) to enable real enforcement.",
+                auth_path,
+            )
+            return EnforceResult(False, "recorded only (needs root)")
+
+        cmd = helper + ["sh", "-c", f"printf 0 > {shlex.quote(str(auth_path))}"]
+        out = self.children.run(cmd)
+        if out is None:
+            return EnforceResult(False, f"recorded only ({self._block_enforcement} failed)")
+
+        try:
+            if auth_path.read_text(encoding="utf-8").strip() == "0":
+                return EnforceResult(True, f"deauthorized via {self._block_enforcement}")
+        except Exception:
+            pass
+        return EnforceResult(False, f"recorded only ({self._block_enforcement} did not take effect)")
+
+    def _privileged_helper(self) -> Optional[list[str]]:
+        if self._block_enforcement == "pkexec" and shutil.which("pkexec"):
+            return ["pkexec"]
+        if self._block_enforcement == "sudo" and shutil.which("sudo"):
+            return ["sudo", "-n"]
+        return None
+
+    def _apply_block(self, ident: UsbIdentity, ev_name: str, sys_path: str, meta: Dict[str, Any]) -> None:
+        self.state.mark_blocked(ident, meta)
+        result = self._enforce_block(sys_path)
+        summary = "USB blocked" if result.ok else "USB block recorded (not enforced)"
+        self.notifier.notify(summary, f"{ev_name}\n{ident.key}\n{result.detail}")
 
     def _run_options_menu(self, prompt: str) -> Optional[str]:
         return self.menu.run(prompt, ["Trust", "Block", "Ignore"])
@@ -517,56 +733,68 @@ class BusWatchd:
             self.notifier.notify(f"USB add: {ev.display_name}", f"{ev.sys_name}\n{ev.sys_path}")
             return
 
+        ident = ev.ident
+        meta = {"name": ev.display_name, "sys_path": ev.sys_path}
+
         # Auto-apply known state first.
-        if self.state.is_blocked(ev.ident):
-            self._try_set_usb_authorized(ev.sys_path, authorized=False)
+        if self.state.is_blocked(ident):
+            result = self._enforce_block(ev.sys_path)
+            summary = "USB blocked" if result.ok else "USB block recorded (not enforced)"
             self.notifier.notify(
-                f"USB blocked: {ev.display_name}",
-                f"{ev.ident.key}\n(known blocked device)",
+                f"{summary}: {ev.display_name}",
+                f"{ident.key}\n(known blocked device) {result.detail}",
             )
             return
 
-        if self.state.is_trusted(ev.ident):
+        if self.state.is_trusted(ident):
             self.notifier.notify(
                 f"USB trusted: {ev.display_name}",
-                f"{ev.ident.key}\n(known trusted device)",
+                f"{ident.key}\n(known trusted device)",
             )
             return
 
         summary = f"USB add: {ev.display_name}"
-        body = f"{ev.ident.key}\n{ev.sys_path}"
+        body = f"{ident.key}\n{ev.sys_path}"
 
         if not self._interactive:
             self.notifier.notify(summary, body)
             return
 
+        # The prompt blocks for up to notify_timeout_ms plus however long the menu
+        # stays open. Run it off the poll loop so no udev events are missed.
+        if not self.prompts.submit(lambda: self._prompt_usb_add(ev, ident, meta, summary, body)):
+            self.notifier.notify(summary, body)
+
+    def _prompt_usb_add(
+        self,
+        ev: UsbEvent,
+        ident: UsbIdentity,
+        meta: Dict[str, Any],
+        summary: str,
+        body: str,
+    ) -> None:
+        """Runs on the prompt thread, never on the udev poll loop."""
         actions = [("default", "Options"), ("trust", "Trust"), ("block", "Block"), ("ignore", "Ignore")]
         choice = self.notifier.prompt_actions(summary, body, actions)
         if not choice:
             return
 
-        meta = {"name": ev.display_name, "sys_path": ev.sys_path}
-
         if choice == "trust":
-            self.state.mark_trusted(ev.ident, meta)
-            self.notifier.notify("USB trusted", f"{ev.display_name}\n{ev.ident.key}")
+            self.state.mark_trusted(ident, meta)
+            self.notifier.notify("USB trusted", f"{ev.display_name}\n{ident.key}")
             return
 
         if choice == "block":
-            self.state.mark_blocked(ev.ident, meta)
-            self._try_set_usb_authorized(ev.sys_path, authorized=False)
-            self.notifier.notify("USB blocked", f"{ev.display_name}\n{ev.ident.key}")
+            self._apply_block(ident, ev.display_name, ev.sys_path, meta)
             return
 
         if choice == "default":
             selection = self._run_options_menu("USB device")
             if selection == "Trust":
-                self.state.mark_trusted(ev.ident, meta)
-                self.notifier.notify("USB trusted", f"{ev.display_name}\n{ev.ident.key}")
+                self.state.mark_trusted(ident, meta)
+                self.notifier.notify("USB trusted", f"{ev.display_name}\n{ident.key}")
             elif selection == "Block":
-                self.state.mark_blocked(ev.ident, meta)
-                self._try_set_usb_authorized(ev.sys_path, authorized=False)
-                self.notifier.notify("USB blocked", f"{ev.display_name}\n{ev.ident.key}")
+                self._apply_block(ident, ev.display_name, ev.sys_path, meta)
             return
 
         # ignore -> nothing
@@ -614,7 +842,7 @@ class BusWatchd:
             else:
                 self.notifier.notify(f"Display change: {connector}", f"{old} -> {new}")
 
-    def _make_usb_event(self, dev: pyudev.Device, action: str) -> UsbEvent:
+    def _make_usb_event(self, dev: "pyudev.Device", action: str) -> UsbEvent:
         sys_path = str(getattr(dev, "sys_path", "") or "")
         device_path = str(getattr(dev, "device_path", "") or "")
         sys_name = str(getattr(dev, "sys_name", "") or "")
@@ -636,7 +864,7 @@ class BusWatchd:
             sys_name=sys_name,
         )
 
-    def handle_device_event(self, dev: pyudev.Device) -> None:
+    def handle_device_event(self, dev: "pyudev.Device") -> None:
         action = str(getattr(dev, "action", None) or dev.properties.get("ACTION") or "").strip()
         subsystem = str(getattr(dev, "subsystem", None) or "").strip()
 
@@ -668,6 +896,21 @@ def load_config(path: Path) -> Dict[str, Any]:
     return data
 
 
+def resolve_state_dir(cfg: Dict[str, Any], cfg_path: Path, cli_state_dir: Optional[str]) -> Path:
+    """
+    --state-dir wins, then config "state_dir", then the config file's directory.
+
+    Deriving from the config file keeps `--config somewhere/else.json` self
+    consistent: trusted.json and blocked.json land next to the config they belong to.
+    """
+    if cli_state_dir:
+        return Path(cli_state_dir).expanduser()
+    from_cfg = cfg.get("state_dir")
+    if from_cfg:
+        return Path(str(from_cfg)).expanduser()
+    return cfg_path.parent
+
+
 def setup_logging(level: str) -> None:
     lvl = getattr(logging, str(level).upper(), logging.INFO)
     logging.basicConfig(
@@ -680,6 +923,12 @@ def setup_logging(level: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="buswatchd - USB/HDMI hotplug notifier")
     ap.add_argument("--config", type=str, required=True, help="Path to config.json")
+    ap.add_argument(
+        "--state-dir",
+        type=str,
+        default=None,
+        help="Directory for trusted.json/blocked.json (default: the config file's directory)",
+    )
     args = ap.parse_args()
 
     cfg_path = Path(args.config).expanduser()
@@ -688,10 +937,11 @@ def main() -> int:
     setup_logging(cfg.get("log_level", "INFO"))
     LOG.info("Starting buswatchd")
 
-    config_dir = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "buswatchd"
-    config_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = resolve_state_dir(cfg, cfg_path, args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    LOG.info("State directory: %s", state_dir)
 
-    daemon = BusWatchd(cfg, config_dir)
+    daemon = BusWatchd(cfg, state_dir)
 
     stop = StopFlag()
 
@@ -707,24 +957,29 @@ def main() -> int:
     try:
         mon.filter_by(subsystem="usb")
         mon.filter_by(subsystem="drm")
-    except Exception:
-        pass
+    except Exception as e:
+        # Running unfiltered would firehose every udev event through the handler.
+        LOG.error("Failed to install udev subsystem filters: %s", e)
+        return 1
 
     mon.start()
+    daemon.start()
 
-    while not stop.is_set():
-        try:
-            dev = mon.poll(timeout=1)
-            if dev is None:
-                continue
-            daemon.handle_device_event(dev)
-        except Exception as e:
-            LOG.warning("Error handling event: %s", e)
+    try:
+        while not stop.is_set():
+            try:
+                dev = mon.poll(timeout=1)
+                if dev is None:
+                    continue
+                daemon.handle_device_event(dev)
+            except Exception as e:
+                LOG.warning("Error handling event: %s", e)
+    finally:
+        LOG.info("Stopping buswatchd")
+        daemon.shutdown()
 
-    LOG.info("Stopping buswatchd")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
